@@ -1,3 +1,4 @@
+mod cert;
 mod cloudflare;
 pub mod dns;
 pub mod ip_comparison;
@@ -183,7 +184,7 @@ impl TestEngine {
                     .await
                     .ok();
 
-                match tls::measure_tls_handshake(&hostname, port).await {
+                match tls::measure_tls_handshake(&hostname, port, self.cfg.certificate_path.as_deref()).await {
                     Ok(summary) => {
                         event_tx
                             .send(TestEvent::DiagnosticTls {
@@ -207,7 +208,12 @@ impl TestEngine {
 
         // Fetch external IPs (runs in parallel, part of default diagnostics)
         if self.cfg.measure_dns {
-            let (v4, v6) = dns::fetch_external_ips(&self.cfg.base_url, self.cfg.resolved_bind_ip).await;
+            let (v4, v6) = dns::fetch_external_ips(
+                &self.cfg.base_url,
+                self.cfg.resolved_bind_ip,
+                self.cfg.certificate_path.as_deref(),
+            )
+            .await;
             external_ipv4 = v4.clone();
             external_ipv6 = v6.clone();
             event_tx
@@ -225,7 +231,13 @@ impl TestEngine {
                 .await
                 .ok();
 
-            match ip_comparison::compare_ip_versions(&self.cfg.base_url, &self.cfg.user_agent, self.cfg.resolved_bind_ip).await
+            match ip_comparison::compare_ip_versions(
+                &self.cfg.base_url,
+                &self.cfg.user_agent,
+                self.cfg.resolved_bind_ip,
+                self.cfg.certificate_path.as_deref(),
+            )
+            .await
             {
                 Ok(comparison) => {
                     event_tx

@@ -20,6 +20,7 @@ pub async fn compare_ip_versions(
     base_url: &str,
     user_agent: &str,
     bind_ip: Option<IpAddr>,
+    cert_path: Option<&std::path::Path>,
 ) -> Result<IpVersionComparison> {
     let url = Url::parse(base_url)?;
     let hostname = url
@@ -47,7 +48,7 @@ pub async fn compare_ip_versions(
 
     // Test IPv4
     let ipv4_result = if let Some(ip) = ipv4_addr {
-        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip).await)
+        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await)
     } else {
         Some(IpVersionResult {
             ip_address: "N/A".to_string(),
@@ -61,7 +62,7 @@ pub async fn compare_ip_versions(
 
     // Test IPv6
     let ipv6_result = if let Some(ip) = ipv6_addr {
-        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip).await)
+        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await)
     } else {
         Some(IpVersionResult {
             ip_address: "N/A".to_string(),
@@ -87,16 +88,32 @@ async fn test_ip_version(
     ip: IpAddr,
     user_agent: &str,
     bind_ip: Option<IpAddr>,
+    cert_path: Option<&std::path::Path>,
 ) -> IpVersionResult {
     use super::network_bind;
 
     let socket_addr = SocketAddr::new(ip, port);
 
     // Build a client that resolves hostname to specific IP
-    let builder = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(30))
         .resolve(hostname, socket_addr);
+    if let Some(path) = cert_path {
+        match super::cert::load_reqwest_certificate(path) {
+            Ok(cert) => builder = builder.add_root_certificate(cert),
+            Err(e) => {
+                return IpVersionResult {
+                    ip_address: ip.to_string(),
+                    download_mbps: 0.0,
+                    upload_mbps: 0.0,
+                    latency_ms: 0.0,
+                    available: false,
+                    error: Some(format!("Failed to load certificate: {}", e)),
+                };
+            }
+        }
+    }
     let client = match network_bind::apply_local_address(builder, bind_ip).build() {
         Ok(c) => c,
         Err(e) => {

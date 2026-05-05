@@ -19,13 +19,24 @@ fn ensure_crypto_provider() {
 ///
 /// This measures only the TLS handshake, not including TCP connection time.
 /// Returns a `TlsSummary` with handshake time, protocol version, and cipher suite.
-pub async fn measure_tls_handshake(hostname: &str, port: u16) -> Result<TlsSummary> {
+pub async fn measure_tls_handshake(
+    hostname: &str,
+    port: u16,
+    cert_path: Option<&std::path::Path>,
+) -> Result<TlsSummary> {
     // Ensure the crypto provider is installed
     ensure_crypto_provider();
 
-    // Create root certificate store from webpki-roots
+    // Create root certificate store from webpki-roots, plus any user-supplied CA.
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = cert_path {
+        for cert in super::cert::load_rustls_certificates(path)? {
+            root_store
+                .add(cert)
+                .with_context(|| format!("failed to add custom CA from {}", path.display()))?;
+        }
+    }
 
     // Build TLS client config
     let config = rustls::ClientConfig::builder()

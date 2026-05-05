@@ -33,48 +33,7 @@ impl CloudflareClient {
 
         // Load custom certificate if provided
         if let Some(ref cert_path) = cfg.certificate_path {
-            // Check file extension
-            let ext = cert_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
-
-            let valid_extensions = ["pem", "crt", "cer", "der"];
-            if let Some(ref ext) = ext {
-                if !valid_extensions.contains(&ext.as_str()) {
-                    return Err(anyhow::anyhow!(
-                        "Invalid certificate file extension '{}'. Expected one of: {}",
-                        ext,
-                        valid_extensions.join(", ")
-                    ));
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Certificate file has no extension. Expected one of: {}",
-                    valid_extensions.join(", ")
-                ));
-            }
-
-            let cert_data = std::fs::read(cert_path).with_context(|| {
-                format!("failed to read certificate from {}", cert_path.display())
-            })?;
-
-            // Parse based on file extension
-            let cert = match ext.as_deref() {
-                Some("der") => reqwest::Certificate::from_der(&cert_data).with_context(|| {
-                    format!(
-                        "failed to parse DER certificate from {}",
-                        cert_path.display()
-                    )
-                })?,
-                _ => reqwest::Certificate::from_pem(&cert_data).with_context(|| {
-                    format!(
-                        "failed to parse PEM certificate from {}",
-                        cert_path.display()
-                    )
-                })?,
-            };
-
+            let cert = super::cert::load_reqwest_certificate(cert_path)?;
             builder = builder.add_root_certificate(cert);
         }
 

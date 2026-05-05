@@ -211,6 +211,7 @@ pub fn extract_hostname(url: &str) -> Option<String> {
 pub async fn fetch_external_ips(
     base_url: &str,
     bind_ip: Option<std::net::IpAddr>,
+    cert_path: Option<&std::path::Path>,
 ) -> (Option<String>, Option<String>) {
     let hostname = match extract_hostname(base_url) {
         Some(h) => h,
@@ -221,8 +222,8 @@ pub async fn fetch_external_ips(
     let url = format!("{}/__down?bytes=0", base_url);
 
     let (ipv4, ipv6) = tokio::join!(
-        fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip),
-        fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip)
+        fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip, cert_path),
+        fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip, cert_path)
     );
 
     (ipv4, ipv6)
@@ -239,6 +240,7 @@ async fn fetch_external_ip_version(
     hostname: &str,
     version: IpVersion,
     bind_ip: Option<std::net::IpAddr>,
+    cert_path: Option<&std::path::Path>,
 ) -> Option<String> {
     use super::network_bind;
     use std::net::SocketAddr;
@@ -258,9 +260,12 @@ async fn fetch_external_ip_version(
     })?;
 
     // Build client that resolves to the specific IP
-    let builder = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .resolve(hostname, target_addr)
         .timeout(Duration::from_secs(5));
+    if let Some(path) = cert_path {
+        builder = builder.add_root_certificate(super::cert::load_reqwest_certificate(path).ok()?);
+    }
     let client = network_bind::apply_local_address(builder, bind_ip)
         .build()
         .ok()?;

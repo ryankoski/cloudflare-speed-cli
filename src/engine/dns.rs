@@ -1,6 +1,6 @@
 //! DNS resolution time measurement module
 
-use crate::model::DnsSummary;
+use crate::model::{DnsSummary, IpVersionFilter};
 use anyhow::{Context, Result};
 use std::net::IpAddr;
 use std::time::Instant;
@@ -208,10 +208,14 @@ pub fn extract_hostname(url: &str) -> Option<String> {
 
 /// Fetch external IPv4 and IPv6 addresses by making requests to Cloudflare.
 /// Returns (ipv4, ipv6) - either may be None if not available.
+///
+/// The `filter` parameter skips fetches for versions that have been disabled
+/// by `--ipv4-only` / `--ipv6-only`.
 pub async fn fetch_external_ips(
     base_url: &str,
     bind_ip: Option<std::net::IpAddr>,
     cert_path: Option<&std::path::Path>,
+    filter: IpVersionFilter,
 ) -> (Option<String>, Option<String>) {
     let hostname = match extract_hostname(base_url) {
         Some(h) => h,
@@ -221,9 +225,24 @@ pub async fn fetch_external_ips(
     // Resolve to get IPv4 and IPv6 addresses
     let url = format!("{}/__down?bytes=0", base_url);
 
+    let want_v4 = matches!(filter, IpVersionFilter::Auto | IpVersionFilter::V4Only);
+    let want_v6 = matches!(filter, IpVersionFilter::Auto | IpVersionFilter::V6Only);
+
     let (ipv4, ipv6) = tokio::join!(
-        fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip, cert_path),
-        fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip, cert_path)
+        async {
+            if want_v4 {
+                fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip, cert_path).await
+            } else {
+                None
+            }
+        },
+        async {
+            if want_v6 {
+                fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip, cert_path).await
+            } else {
+                None
+            }
+        }
     );
 
     (ipv4, ipv6)

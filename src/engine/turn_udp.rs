@@ -158,18 +158,23 @@ pub async fn run_udp_like_loss_probe(
         return Err(anyhow!("dns returned no addresses for {}", host));
     }
 
-    // When a bind IP is set, only target addresses of the matching family are
-    // reachable: a UDP socket bound to a v4 source can't connect() to a v6
-    // peer (EAFNOSUPPORT) and vice versa.
-    let candidates: Vec<SocketAddr> = match cfg.resolved_bind_ip {
-        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
-        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
-        None => resolved,
-    };
+    // Apply --ipv4-only / --ipv6-only first, then narrow by bind IP family.
+    // A UDP socket bound to a v4 source can't connect() to a v6 peer
+    // (EAFNOSUPPORT) and vice versa, so both filters must match.
+    let candidates: Vec<SocketAddr> = resolved
+        .iter()
+        .copied()
+        .filter(|a| cfg.ip_version.allows_socket(*a))
+        .filter(|a| match cfg.resolved_bind_ip {
+            Some(IpAddr::V4(_)) => a.is_ipv4(),
+            Some(IpAddr::V6(_)) => a.is_ipv6(),
+            None => true,
+        })
+        .collect();
 
     if candidates.is_empty() {
         return Err(anyhow!(
-            "no resolved address for {} matches the bind IP family",
+            "no resolved address for {} matches the requested IP family / bind IP",
             host
         ));
     }
@@ -290,8 +295,11 @@ async fn bind_and_connect_udp(
     candidates: &[SocketAddr],
     cfg: &RunConfig,
 ) -> Result<(UdpSocket, SocketAddr)> {
-    let bind_addr =
-        network_bind::resolve_bind_address(cfg.interface.as_ref(), cfg.source_ip.as_ref())?;
+    let bind_addr = network_bind::resolve_bind_address(
+        cfg.interface.as_ref(),
+        cfg.source_ip.as_ref(),
+        cfg.ip_version,
+    )?;
 
     let mut last_err: Option<anyhow::Error> = None;
     for &addr in candidates {

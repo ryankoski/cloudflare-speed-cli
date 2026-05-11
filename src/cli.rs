@@ -1,5 +1,5 @@
 use crate::engine::{EngineControl, TestEngine};
-use crate::model::{RunConfig, TestEvent};
+use crate::model::{IpVersionFilter, RunConfig, TestEvent};
 use anyhow::{Context, Result};
 use clap::Parser;
 use rand::RngCore;
@@ -114,11 +114,11 @@ pub struct Cli {
     pub traceroute_max_hops: u8,
 
     /// Force IPv4 only (no IPv6)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["ipv6_only", "compare_ip_versions"])]
     pub ipv4_only: bool,
 
     /// Force IPv6 only (no IPv4)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["ipv4_only", "compare_ip_versions"])]
     pub ipv6_only: bool,
 
     /// Skip default diagnostic measurements (DNS, TLS)
@@ -189,10 +189,21 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
     // DNS and TLS run by default unless --skip-diagnostics is set
     let skip = args.skip_diagnostics;
 
-    // Resolve bind address once from --interface or --source
+    let ip_version = if args.ipv4_only {
+        IpVersionFilter::V4Only
+    } else if args.ipv6_only {
+        IpVersionFilter::V6Only
+    } else {
+        IpVersionFilter::Auto
+    };
+
+    // Resolve bind address once from --interface or --source.
+    // Pass the IP-version filter so an interface lookup picks the matching family
+    // and a --source IP whose family conflicts is rejected.
     let resolved_bind_ip = network_bind::resolve_bind_address(
         args.interface.as_ref(),
         args.source.as_ref(),
+        ip_version,
     )?
     .map(|addr| addr.ip());
 
@@ -202,6 +213,18 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
         } else {
             eprintln!("Binding HTTP connections to source IP: {}", ip);
         }
+    }
+
+    // A proxy terminates our connection and performs its own DNS/dialing, so we
+    // cannot pin the address family for traffic routed through it. Direct
+    // measurements (TLS, UDP, traceroute) still honour the filter, so warn
+    // rather than error.
+    if args.proxy.is_some() && ip_version != IpVersionFilter::Auto {
+        eprintln!(
+            "warning: --{}-only cannot be enforced for HTTP traffic routed through --proxy; \
+             the proxy selects the address family for those requests",
+            ip_version.label().to_lowercase()
+        );
     }
 
     Ok(RunConfig {
@@ -229,8 +252,7 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
         compare_ip_versions: args.compare_ip_versions,
         traceroute: args.traceroute,
         traceroute_max_hops: args.traceroute_max_hops,
-        ipv4_only: args.ipv4_only,
-        ipv6_only: args.ipv6_only,
+        ip_version,
         udp_packets: args.udp_packets,
     })
 }

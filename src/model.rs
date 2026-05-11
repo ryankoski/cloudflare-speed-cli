@@ -1,6 +1,63 @@
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IpVersionFilter {
+    #[default]
+    Auto,
+    V4Only,
+    V6Only,
+}
+
+impl IpVersionFilter {
+    pub fn allows_ip(&self, addr: IpAddr) -> bool {
+        match self {
+            IpVersionFilter::Auto => true,
+            IpVersionFilter::V4Only => addr.is_ipv4(),
+            IpVersionFilter::V6Only => addr.is_ipv6(),
+        }
+    }
+
+    pub fn allows_socket(&self, addr: SocketAddr) -> bool {
+        self.allows_ip(addr.ip())
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            IpVersionFilter::Auto => "auto",
+            IpVersionFilter::V4Only => "IPv4",
+            IpVersionFilter::V6Only => "IPv6",
+        }
+    }
+}
+
+#[cfg(test)]
+mod ip_version_filter_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn auto_allows_both_families() {
+        let f = IpVersionFilter::Auto;
+        assert!(f.allows_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(f.allows_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn v4_only_rejects_v6() {
+        let f = IpVersionFilter::V4Only;
+        assert!(f.allows_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!f.allows_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn v6_only_rejects_v4() {
+        let f = IpVersionFilter::V6Only;
+        assert!(!f.allows_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(f.allows_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+}
 
 mod loss_percent_serde {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -52,8 +109,8 @@ pub struct RunConfig {
     pub compare_ip_versions: bool,
     pub traceroute: bool,
     pub traceroute_max_hops: u8,
-    pub ipv4_only: bool,
-    pub ipv6_only: bool,
+    #[serde(default)]
+    pub ip_version: IpVersionFilter,
     pub udp_packets: u64,
 }
 

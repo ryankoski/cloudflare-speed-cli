@@ -165,6 +165,14 @@ pub fn max_y(points: &[(f64, f64)]) -> f64 {
     points.iter().map(|(_, y)| *y).fold(0.0, |a, b| a.max(b))
 }
 
+fn is_ipv4_str(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+fn is_ipv6_str(s: &str) -> bool {
+    s.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 fn udp_split_bar(sent: u64, received: u64, width: usize) -> Line<'static> {
     let safe_sent = sent.max(1);
     let safe_received = received.min(safe_sent);
@@ -777,13 +785,28 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     }
     network_lines.push(Line::from(your_network));
 
+    // Fall back to state.ip (the connection IP from /cdn-cgi/trace) only when
+    // its family matches the row — otherwise --ipv6-only would surface an IPv6
+    // address in the IPv4 row.
     let external_ipv4_display = if hide {
         REDACTED_PLACEHOLDER.to_string()
     } else {
         state
             .external_ipv4
             .as_deref()
-            .unwrap_or(state.ip.as_deref().unwrap_or("-"))
+            .or_else(|| state.ip.as_deref().filter(|s| is_ipv4_str(s)))
+            .unwrap_or("-")
+            .to_string()
+    };
+
+    let external_ipv6_display = if hide {
+        REDACTED_PLACEHOLDER.to_string()
+    } else {
+        state
+            .external_ipv6
+            .as_deref()
+            .or_else(|| state.ip.as_deref().filter(|s| is_ipv6_str(s)))
+            .unwrap_or("-")
             .to_string()
     };
 
@@ -794,10 +817,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
         Line::from(vec![
             Span::styled("External IPv6: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                show_or_redact(state.external_ipv6.as_deref(), hide).to_string(),
-                Style::default().fg(Color::Cyan),
-            ),
+            Span::styled(external_ipv6_display, Style::default().fg(Color::Cyan)),
         ]),
     ]);
 

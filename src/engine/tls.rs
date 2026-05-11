@@ -1,6 +1,6 @@
 //! TLS handshake time measurement module
 
-use crate::model::TlsSummary;
+use crate::model::{IpVersionFilter, TlsSummary};
 use anyhow::{anyhow, Context, Result};
 use rustls::pki_types::ServerName;
 use std::net::{IpAddr, SocketAddr};
@@ -39,6 +39,7 @@ pub async fn measure_tls_handshake(
     port: u16,
     cert_path: Option<&std::path::Path>,
     bind_ip: Option<IpAddr>,
+    filter: IpVersionFilter,
 ) -> Result<TlsSummary> {
     // Ensure the crypto provider is installed
     ensure_crypto_provider();
@@ -68,7 +69,9 @@ pub async fn measure_tls_handshake(
     let connector = TlsConnector::from(Arc::new(config));
 
     // Resolve and connect, trying each address until one succeeds.
-    let tcp_stream = connect_tcp(hostname, port, bind_ip).await?;
+    // Candidates are filtered by both the IP-version filter (--ipv4-only / --ipv6-only)
+    // and the bind IP family so the kernel can actually reach them.
+    let tcp_stream = connect_tcp(hostname, port, bind_ip, filter).await?;
 
     // Parse server name for TLS
     let server_name: ServerName<'static> = hostname
@@ -108,6 +111,7 @@ async fn connect_tcp(
     hostname: &str,
     port: u16,
     bind_ip: Option<IpAddr>,
+    filter: IpVersionFilter,
 ) -> Result<tokio::net::TcpStream> {
     let lookup_target = format!("{}:{}", hostname, port);
     let resolved: Vec<SocketAddr> = lookup_host(&lookup_target)
@@ -119,16 +123,21 @@ async fn connect_tcp(
         return Err(anyhow!("DNS returned no addresses for {}", hostname));
     }
 
-    // Filter by bind family if set; otherwise try all.
-    let candidates: Vec<SocketAddr> = match bind_ip {
-        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
-        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
-        None => resolved.clone(),
-    };
+    // Filter by IP-version selection first, then by bind family if set.
+    let candidates: Vec<SocketAddr> = resolved
+        .iter()
+        .copied()
+        .filter(|a| filter.allows_socket(*a))
+        .filter(|a| match bind_ip {
+            Some(IpAddr::V4(_)) => a.is_ipv4(),
+            Some(IpAddr::V6(_)) => a.is_ipv6(),
+            None => true,
+        })
+        .collect();
 
     if candidates.is_empty() {
         return Err(anyhow!(
-            "no resolved address for {} matches the bind IP family",
+            "no resolved address for {} matches the requested IP family / bind IP",
             hostname
         ));
     }

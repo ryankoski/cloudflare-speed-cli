@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use reqwest::Url;
+use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::model::RunConfig;
+use crate::model::{IpVersionFilter, RunConfig};
 
 #[derive(Clone)]
 pub struct CloudflareClient {
@@ -12,7 +13,7 @@ pub struct CloudflareClient {
 }
 
 impl CloudflareClient {
-    pub fn new(cfg: &RunConfig) -> Result<Self> {
+    pub async fn new(cfg: &RunConfig) -> Result<Self> {
         let base_url = Url::parse(&cfg.base_url).context("invalid base_url")?;
 
         let mut default_headers = reqwest::header::HeaderMap::new();
@@ -30,6 +31,32 @@ impl CloudflareClient {
             .tcp_keepalive(Duration::from_secs(15));
 
         builder = network_bind::apply_local_address(builder, cfg.resolved_bind_ip);
+
+        // Constrain DNS resolution to the requested IP version by pre-resolving
+        // the base host and pinning reqwest's resolver to the matching addresses.
+        if cfg.ip_version != IpVersionFilter::Auto {
+            let host = base_url
+                .host_str()
+                .context("base_url has no host")?
+                .to_string();
+            let port = base_url.port_or_known_default().unwrap_or(443);
+            let lookup = format!("{}:{}", host, port);
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup)
+                .await
+                .with_context(|| format!("DNS lookup failed for {}", host))?
+                .filter(|a| cfg.ip_version.allows_socket(*a))
+                .collect();
+
+            if addrs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "DNS returned no {} addresses for {}",
+                    cfg.ip_version.label(),
+                    host
+                ));
+            }
+
+            builder = builder.resolve_to_addrs(&host, &addrs);
+        }
 
         // Load custom certificate if provided
         if let Some(ref cert_path) = cfg.certificate_path {

@@ -4,7 +4,7 @@
 //! Uses raw ICMP sockets when available (requires CAP_NET_RAW or root),
 //! with fallback to system traceroute command.
 
-use crate::model::{TestEvent, TracerouteHop, TracerouteSummary};
+use crate::model::{IpVersionFilter, TestEvent, TracerouteHop, TracerouteSummary};
 use anyhow::{Context, Result};
 use pnet_packet::icmp::IcmpTypes;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -30,12 +30,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub async fn run_traceroute(
     destination: &str,
     max_hops: u8,
+    filter: IpVersionFilter,
     event_tx: &mpsc::Sender<TestEvent>,
     bind_ip: Option<IpAddr>,
     interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
-    // Resolve destination to IP, preferring the bind IP's family when set.
-    let ip = resolve_destination(destination, bind_ip)?;
+    // Resolve destination to IP, restricted to the requested IP-version filter
+    // and (when set) the bind IP's family.
+    let ip = resolve_destination(destination, filter, bind_ip)?;
 
     // Try raw ICMP first
     match run_icmp_traceroute(&ip, max_hops, event_tx, bind_ip, interface).await {
@@ -54,24 +56,43 @@ pub async fn run_traceroute(
     run_system_traceroute(destination, &ip, max_hops, event_tx, bind_ip, interface).await
 }
 
-/// Resolve destination hostname to IP address. When `bind_ip` is set, prefer
-/// a resolved address of the same family; if none exists, error rather than
-/// returning an address the bound socket can't reach.
-fn resolve_destination(destination: &str, bind_ip: Option<IpAddr>) -> Result<IpAddr> {
+/// Resolve destination hostname to IP address. The `filter` restricts the
+/// result to a single family when `--ipv4-only` / `--ipv6-only` is set, and
+/// `bind_ip` further constrains the resolved address to the bind IP's family.
+fn resolve_destination(
+    destination: &str,
+    filter: IpVersionFilter,
+    bind_ip: Option<IpAddr>,
+) -> Result<IpAddr> {
     // Try to parse as IP first
     if let Ok(ip) = destination.parse::<IpAddr>() {
+        if !filter.allows_ip(ip) {
+            return Err(anyhow::anyhow!(
+                "{} is not an {} address",
+                ip,
+                filter.label()
+            ));
+        }
         return Ok(ip);
     }
 
-    // Try DNS resolution
+    // DNS resolution, restricted to the requested IP-version filter.
     let addrs: Vec<IpAddr> = format!("{}:0", destination)
         .to_socket_addrs()
         .with_context(|| format!("Failed to resolve {}", destination))?
         .map(|a| a.ip())
+        .filter(|ip| filter.allows_ip(*ip))
         .collect();
 
     if addrs.is_empty() {
-        return Err(anyhow::anyhow!("No addresses found for {}", destination));
+        return Err(match filter {
+            IpVersionFilter::Auto => anyhow::anyhow!("No addresses found for {}", destination),
+            _ => anyhow::anyhow!(
+                "No {} addresses found for {}",
+                filter.label(),
+                destination
+            ),
+        });
     }
 
     match bind_ip {
@@ -314,30 +335,64 @@ async fn run_system_traceroute(
     bind_ip: Option<IpAddr>,
     interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
-    // Clone strings to avoid lifetime issues with spawn_blocking
-    let dest = destination.to_string();
+    // Target the already-resolved IP literal rather than the hostname: its
+    // family is exactly what resolve_destination selected (honoring
+    // --ipv4-only / --ipv6-only and the bind IP), so the external command can't
+    // re-resolve to a different family. Cloned for spawn_blocking.
     let dest_ip_str = destination_ip.to_string();
+    let is_v6 = destination_ip.is_ipv6();
 
-    // Determine which command to use based on OS.
-    // Note: -n / -d intentionally NOT passed so the OS resolves hostnames.
-    // Source IP and interface flags differ per platform:
-    //   - tracert (Windows):     -S <srcaddr> only, no interface flag.
-    //   - traceroute (Linux/BSD): -i <interface> and -s <source>.
+    // Pick the command per platform. The family comes from the resolved
+    // address, so Auto, --ipv4-only, and --ipv6-only all work.
+    // Note: -n / -d intentionally NOT passed so hop IPs still resolve to names.
+    //   - tracert (Windows):  one binary; -4 / -6 forces family, -S <src>.
+    //   - traceroute (Linux): one binary; -4 / -6 forces family.
+    //   - macOS/BSD:          plain `traceroute` is IPv4-only and rejects -6;
+    //                         IPv6 needs the separate `traceroute6` binary.
+    //                         Both accept the same -m / -q / -i / -s options.
     let (cmd, args): (&'static str, Vec<String>) = if cfg!(target_os = "windows") {
-        let mut args = vec!["-h".to_string(), max_hops.to_string()];
+        let mut args = vec![
+            if is_v6 { "-6" } else { "-4" }.to_string(),
+            "-h".to_string(),
+            max_hops.to_string(),
+        ];
         if let Some(ip) = bind_ip {
             args.push("-S".to_string());
             args.push(ip.to_string());
         }
-        args.push(dest.clone());
+        args.push(dest_ip_str.clone());
         ("tracert", args)
     } else {
-        let mut args = vec![
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        let (cmd, family_flag): (&'static str, Option<&'static str>) =
+            (if is_v6 { "traceroute6" } else { "traceroute" }, None);
+
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
+        let (cmd, family_flag): (&'static str, Option<&'static str>) =
+            ("traceroute", Some(if is_v6 { "-6" } else { "-4" }));
+
+        let mut args = Vec::new();
+        if let Some(flag) = family_flag {
+            args.push(flag.to_string());
+        }
+        args.extend([
             "-m".to_string(),
             max_hops.to_string(),
             "-q".to_string(),
             "3".to_string(),
-        ];
+        ]);
         if let Some(iface) = interface {
             args.push("-i".to_string());
             args.push(iface.to_string());
@@ -346,8 +401,8 @@ async fn run_system_traceroute(
             args.push("-s".to_string());
             args.push(ip.to_string());
         }
-        args.push(dest.clone());
-        ("traceroute", args)
+        args.push(dest_ip_str.clone());
+        (cmd, args)
     };
 
     let output = tokio::task::spawn_blocking(move || Command::new(cmd).args(&args).output())

@@ -10,8 +10,8 @@ pub mod traceroute;
 mod turn_udp;
 
 use crate::model::{
-    DnsSummary, IpVersionComparison, Phase, RunConfig, RunResult, TestEvent, TlsSummary,
-    TracerouteSummary,
+    DnsSummary, IpVersionComparison, IpVersionFilter, Phase, RunConfig, RunResult, TestEvent,
+    TlsSummary, TracerouteSummary,
 };
 use anyhow::Result;
 use std::sync::{
@@ -52,7 +52,7 @@ impl TestEngine {
         event_tx: mpsc::Sender<TestEvent>,
         mut control_rx: mpsc::Receiver<EngineControl>,
     ) -> Result<RunResult> {
-        let client = cloudflare::CloudflareClient::new(&self.cfg)?;
+        let client = cloudflare::CloudflareClient::new(&self.cfg).await?;
 
         let paused = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -189,6 +189,7 @@ impl TestEngine {
                     port,
                     self.cfg.certificate_path.as_deref(),
                     self.cfg.resolved_bind_ip,
+                    self.cfg.ip_version,
                 )
                 .await
                 {
@@ -213,12 +214,14 @@ impl TestEngine {
             }
         }
 
-        // Fetch external IPs (runs in parallel, part of default diagnostics)
+        // Fetch external IPs (runs in parallel, part of default diagnostics).
+        // Honour --ipv4-only / --ipv6-only by skipping the disabled family entirely.
         if self.cfg.measure_dns {
             let (v4, v6) = dns::fetch_external_ips(
                 &self.cfg.base_url,
                 self.cfg.resolved_bind_ip,
                 self.cfg.certificate_path.as_deref(),
+                self.cfg.ip_version,
             )
             .await;
             external_ipv4 = v4.clone();
@@ -229,8 +232,9 @@ impl TestEngine {
                 .ok();
         }
 
-        // IPv4 vs IPv6 comparison
-        if self.cfg.compare_ip_versions {
+        // IPv4 vs IPv6 comparison. Clap rejects this combined with --ipv4-only/--ipv6-only,
+        // but guard defensively in case the engine is invoked outside the CLI.
+        if self.cfg.compare_ip_versions && self.cfg.ip_version == IpVersionFilter::Auto {
             event_tx
                 .send(TestEvent::Info {
                     message: "Comparing IPv4 vs IPv6 performance...".to_string(),
@@ -282,6 +286,7 @@ impl TestEngine {
                 match traceroute::run_traceroute(
                     &hostname,
                     self.cfg.traceroute_max_hops,
+                    self.cfg.ip_version,
                     &event_tx,
                     self.cfg.resolved_bind_ip,
                     self.cfg.interface.as_deref(),

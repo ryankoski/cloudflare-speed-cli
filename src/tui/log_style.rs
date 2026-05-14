@@ -57,6 +57,12 @@ pub fn style_log_line(line: &str) -> Line<'static> {
 /// Walk the string, emitting Spans for runs of text and numbers (with optional
 /// units). Units recognised: `Mbps`, `ms`, `%` (either attached or after one
 /// space).
+///
+/// A digit run is only treated as a standalone number when it isn't part of an
+/// identifier — i.e. the preceding character isn't a letter or `_`, and the
+/// trailing character isn't a letter (other than a recognised unit) or `_`.
+/// This keeps tokens like `TLSv1_3`, `wlp4s0`, or `TELUS-HSIA-NVCRBC01` out of
+/// the highlighter.
 fn highlight_numbers(s: &str, mbps_color: Color) -> Vec<Span<'static>> {
     let chars: Vec<char> = s.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -65,11 +71,20 @@ fn highlight_numbers(s: &str, mbps_color: Color) -> Vec<Span<'static>> {
 
     while i < chars.len() {
         if chars[i].is_ascii_digit() {
-            if !buf.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut buf),
-                    Style::default().fg(LABEL),
-                ));
+            // Identifier continuation: previous char in `buf` is a letter or
+            // underscore. Absorb the digit run (incl. dots/underscores so we
+            // keep "TLSv1_3" together) into the text buffer.
+            if buf
+                .chars()
+                .last()
+                .map(is_ident_char)
+                .unwrap_or(false)
+            {
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                    buf.push(chars[i]);
+                    i += 1;
+                }
+                continue;
             }
 
             // Greedily read a number (digits and dots). IP addresses end up
@@ -86,21 +101,28 @@ fn highlight_numbers(s: &str, mbps_color: Color) -> Vec<Span<'static>> {
             }
 
             let rest: String = chars[i..].iter().collect();
-            let (unit_str, unit_len, color, with_space) = if rest.starts_with("Mbps") {
-                ("Mbps", 4, mbps_color, false)
-            } else if rest.starts_with("ms") && !next_is_alpha(&rest, 2) {
-                ("ms", 2, LATENCY, false)
-            } else if rest.starts_with('%') {
-                ("%", 1, PERCENT, false)
-            } else if rest.starts_with(" Mbps") {
-                ("Mbps", 5, mbps_color, true)
-            } else if rest.starts_with(" ms") && !next_is_alpha(&rest, 3) {
-                ("ms", 3, LATENCY, true)
-            } else {
-                ("", 0, NUMBER, false)
-            };
+            let unit = recognised_unit(&rest, mbps_color);
 
-            if unit_len > 0 {
+            // If the number is followed by an identifier char (letter or `_`)
+            // and we didn't match a recognised unit, treat the whole thing as
+            // part of an identifier — flush buf+num as plain text.
+            let trailing_is_ident = chars.get(i).copied().map(is_ident_char).unwrap_or(false);
+            if unit.is_none() && trailing_is_ident {
+                buf.push_str(&num);
+                if trailing_dot {
+                    buf.push('.');
+                }
+                continue;
+            }
+
+            if !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    Style::default().fg(LABEL),
+                ));
+            }
+
+            if let Some((unit_str, unit_len, color, with_space)) = unit {
                 let combined = if with_space {
                     format!("{} {}", num, unit_str)
                 } else {
@@ -126,8 +148,27 @@ fn highlight_numbers(s: &str, mbps_color: Color) -> Vec<Span<'static>> {
     spans
 }
 
-fn next_is_alpha(s: &str, offset: usize) -> bool {
-    s.chars().nth(offset).map(|c| c.is_alphabetic()).unwrap_or(false)
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+/// Returns `(unit_text, consumed_len, color, with_leading_space)` if `rest`
+/// begins with a recognised unit. The unit must NOT be followed by another
+/// identifier char, so things like `msX` or `Mbpsblah` don't match.
+fn recognised_unit(rest: &str, mbps_color: Color) -> Option<(&'static str, usize, Color, bool)> {
+    let cases: &[(&str, &str, usize, Color, bool)] = &[
+        (" Mbps", "Mbps", 5, mbps_color, true),
+        (" ms", "ms", 3, LATENCY, true),
+        ("Mbps", "Mbps", 4, mbps_color, false),
+        ("ms", "ms", 2, LATENCY, false),
+        ("%", "%", 1, PERCENT, false),
+    ];
+    for (prefix, unit, len, color, with_space) in cases.iter() {
+        if rest.starts_with(prefix) && !rest[prefix.len()..].chars().next().map(is_ident_char).unwrap_or(false) {
+            return Some((*unit, *len, *color, *with_space));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -167,5 +208,43 @@ mod tests {
     fn header_is_styled_as_single_span() {
         let line = style_log_line("== Summary ==");
         assert_eq!(line.spans.len(), 1);
+    }
+
+    /// Returns the styled portions (spans whose fg is NOT the plain text colour).
+    /// Used to assert which substrings the highlighter actually picks out.
+    fn highlighted_substrings(line: &str) -> Vec<String> {
+        style_log_line(line)
+            .spans
+            .iter()
+            .filter(|s| s.style.fg.is_some() && s.style.fg != Some(LABEL))
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn does_not_highlight_digits_inside_identifiers() {
+        // Numbers embedded in TLS protocol/cipher names must stay un-coloured.
+        let line = "TLS: handshake 16.60ms, TLSv1_3 TLS_AES_256_GCM_SHA384";
+        let highlighted = highlighted_substrings(line);
+        assert_eq!(highlighted, vec!["16.60ms".to_string()]);
+    }
+
+    #[test]
+    fn does_not_highlight_digits_in_interface_or_ssid() {
+        // Interface names (wlp4s0) and SSID-style strings (TELUS-HSIA-NVCRBC01)
+        // contain digits that are part of identifiers — leave them alone.
+        let line = "Interface wlp4s0 on TELUS-HSIA-NVCRBC01";
+        assert_eq!(highlighted_substrings(line), Vec::<String>::new());
+    }
+
+    #[test]
+    fn still_highlights_standalone_metrics() {
+        let line = "Download: 282.34 Mbps";
+        assert_eq!(highlighted_substrings(line), vec!["282.34 Mbps".to_string()]);
+
+        let line = "Packet loss probe: 50/100 recv 48 loss 4.0% (12.1ms)";
+        let hl = highlighted_substrings(line);
+        assert!(hl.contains(&"4.0%".to_string()), "got {hl:?}");
+        assert!(hl.contains(&"12.1ms".to_string()), "got {hl:?}");
     }
 }

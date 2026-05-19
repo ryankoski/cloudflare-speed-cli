@@ -112,7 +112,7 @@ fn gather_default_network_info() -> (Option<String>, Option<String>, Option<bool
 }
 
 /// Get the default network interface name
-#[cfg(not(windows))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn get_default_interface() -> Option<String> {
     // Try to get interface from default route
     if let Ok(output) = Command::new("ip")
@@ -148,7 +148,31 @@ fn get_default_interface() -> Option<String> {
     None
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+fn get_default_interface() -> Option<String> {
+    // Use `route -n get default` to find the default interface
+    if let Ok(output) = Command::new("route").args(&["-n", "get", "default"]).output() {
+        if output.status.success() {
+            if let Ok(output_str) = String::from_utf8(output.stdout) {
+                for line in output_str.lines() {
+                    let line = line.trim();
+                    if line.starts_with("interface:") {
+                        if let Some(iface) = line.splitn(2, ':').nth(1) {
+                            let iface = iface.trim().to_string();
+                            if !iface.is_empty() {
+                                return Some(iface);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn get_default_interface() -> Option<String> {
     let output = Command::new("powershell")
         .args(&[
@@ -187,14 +211,38 @@ fn get_default_interface() -> Option<String> {
 }
 
 /// Check if interface is wireless
-#[cfg(not(windows))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn check_if_wireless(iface: &str) -> Option<bool> {
     // Check if /sys/class/net/<iface>/wireless exists
     let wireless_path = format!("/sys/class/net/{}/wireless", iface);
     Some(std::path::Path::new(&wireless_path).exists())
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+fn check_if_wireless(iface: &str) -> Option<bool> {
+    // Parse `networksetup -listallhardwareports` to check if the interface is Wi-Fi
+    if let Ok(output) = Command::new("networksetup").arg("-listallhardwareports").output() {
+        if let Ok(output_str) = String::from_utf8(output.stdout) {
+            let mut is_wifi_section = false;
+            for line in output_str.lines() {
+                let line = line.trim();
+                if line.starts_with("Hardware Port:") {
+                    let port_name = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_lowercase();
+                    is_wifi_section = port_name.contains("wi-fi") || port_name.contains("airport");
+                } else if line.starts_with("Device:") {
+                    if let Some(device) = line.splitn(2, ':').nth(1) {
+                        if device.trim() == iface {
+                            return Some(is_wifi_section);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+#[cfg(target_os = "windows")]
 fn check_if_wireless(iface: &str) -> Option<bool> {
     let output = Command::new("netsh")
         .args(&["wlan", "show", "interfaces"])
@@ -209,7 +257,7 @@ fn check_if_wireless(iface: &str) -> Option<bool> {
 }
 
 /// Get wireless SSID for an interface
-#[cfg(not(windows))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn get_wireless_ssid(iface: &str) -> Option<String> {
     // Try iwgetid first (most reliable)
     if let Ok(output) = Command::new("iwgetid").arg("-r").arg(iface).output() {
@@ -238,7 +286,46 @@ fn get_wireless_ssid(iface: &str) -> Option<String> {
     None
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+fn get_wireless_ssid(iface: &str) -> Option<String> {
+    // Try `networksetup -getairportnetwork <iface>` (public API)
+    if let Ok(output) = Command::new("networksetup")
+        .args(&["-getairportnetwork", iface])
+        .output()
+    {
+        if let Ok(output_str) = String::from_utf8(output.stdout) {
+            let output_str = output_str.trim();
+            if let Some(ssid) = output_str.strip_prefix("Current Wi-Fi Network:") {
+                let ssid = ssid.trim().to_string();
+                if !ssid.is_empty() {
+                    return Some(ssid);
+                }
+            }
+        }
+    }
+
+    // Fallback: try the airport command (deprecated in newer macOS but widely available)
+    let airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+    if let Ok(output) = Command::new(airport).arg("-I").output() {
+        if let Ok(output_str) = String::from_utf8(output.stdout) {
+            for line in output_str.lines() {
+                let line = line.trim();
+                if line.starts_with("SSID:") {
+                    if let Some(ssid) = line.splitn(2, ':').nth(1) {
+                        let ssid = ssid.trim().to_string();
+                        if !ssid.is_empty() {
+                            return Some(ssid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn get_wireless_ssid(iface: &str) -> Option<String> {
     let output = Command::new("netsh")
         .args(&["wlan", "show", "interfaces"])
@@ -269,7 +356,7 @@ fn get_wireless_ssid(iface: &str) -> Option<String> {
 }
 
 /// Get MAC address of interface
-#[cfg(not(windows))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn get_interface_mac(iface: &str) -> Option<String> {
     let mac_path = format!("/sys/class/net/{}/address", iface);
     std::fs::read_to_string(mac_path)
@@ -278,7 +365,27 @@ fn get_interface_mac(iface: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+fn get_interface_mac(iface: &str) -> Option<String> {
+    // Use `ifconfig <iface>` and parse the `ether` line
+    if let Ok(output) = Command::new("ifconfig").arg(iface).output() {
+        if output.status.success() {
+            if let Ok(output_str) = String::from_utf8(output.stdout) {
+                for line in output_str.lines() {
+                    let line = line.trim();
+                    if line.starts_with("ether ") {
+                        if let Some(mac) = line.split_whitespace().nth(1) {
+                            return Some(mac.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
 fn get_interface_mac(iface: &str) -> Option<String> {
     let output = Command::new("powershell")
         .args(&[

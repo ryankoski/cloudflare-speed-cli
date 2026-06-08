@@ -82,11 +82,18 @@ pub fn get_interface_for_ip(ip_str: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Name of the loopback interface on the current platform.
+    /// Linux/Android call it "lo"; macOS and the BSDs call it "lo0".
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LOOPBACK_IFACE: &str = "lo";
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LOOPBACK_IFACE: &str = "lo0";
+
     #[test]
     fn test_get_interface_for_ip_loopback() {
-        // 127.0.0.1 is always bound to "lo" on Linux
+        // 127.0.0.1 is bound to the loopback interface ("lo" on Linux, "lo0" on macOS/BSD)
         let iface = get_interface_for_ip("127.0.0.1");
-        assert_eq!(iface, Some("lo".to_string()));
+        assert_eq!(iface, Some(LOOPBACK_IFACE.to_string()));
     }
 
     #[test]
@@ -104,7 +111,7 @@ mod tests {
 
     #[test]
     fn test_get_interface_ip_loopback() {
-        let ip = get_interface_ip("lo").unwrap();
+        let ip = get_interface_ip(LOOPBACK_IFACE).unwrap();
         assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
     }
 
@@ -116,10 +123,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_interface_to_ip_and_back() {
-        // Get the IP for loopback, then reverse-lookup should return "lo"
-        let ip = get_interface_ip("lo").unwrap();
+        // Get the IP for loopback, then reverse-lookup should return the loopback name
+        let ip = get_interface_ip(LOOPBACK_IFACE).unwrap();
         let iface = get_interface_for_ip(&ip.to_string());
-        assert_eq!(iface, Some("lo".to_string()));
+        assert_eq!(iface, Some(LOOPBACK_IFACE.to_string()));
     }
 
     #[test]
@@ -145,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_resolve_bind_address_interface() {
-        let iface = "lo".to_string();
+        let iface = LOOPBACK_IFACE.to_string();
         let result = resolve_bind_address(Some(&iface), None).unwrap();
         let addr = result.unwrap();
         assert_eq!(addr.ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
@@ -154,7 +161,7 @@ mod tests {
     #[test]
     fn test_resolve_bind_address_source_takes_priority() {
         // When both are provided, source_ip wins
-        let iface = "lo".to_string();
+        let iface = LOOPBACK_IFACE.to_string();
         let source = "192.168.1.1".to_string();
         let result = resolve_bind_address(Some(&iface), Some(&source)).unwrap();
         let addr = result.unwrap();
